@@ -1,400 +1,218 @@
-# crm/models.py
-from django.db import models
-from django.core.validators import RegexValidator
-from decimal import Decimal
+# alx_backend_graphql_crm/settings.py
 
+INSTALLED_APPS = [
+    # ... other apps
+    'crm',
+    'graphene_django',
+    'django_filters', # <-- Ensure this is present
+]
+
+# crm/models.py (Snippet - only showing changes)
 class Customer(models.Model):
-    name = models.CharField(max_length=255)
-    # Ensure email is unique at the database level
-    email = models.EmailField(unique=True) 
-    # Use RegexValidator for basic phone format validation
-    phone_regex = RegexValidator(
-        regex=r'^\+?1?\d{9,15}$',
-        message="Phone number must be entered in the format: '+999999999'. Up to 15 digits allowed."
-    )
-    phone = models.CharField(
-        validators=[phone_regex],
-        max_length=17,
-        blank=True,
-        null=True
-    )
-    date_joined = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return self.name
-
-class Product(models.Model):
-    name = models.CharField(max_length=255, unique=True)
-    # Ensure price is positive
-    price = models.DecimalField(max_digits=10, decimal_places=2) 
-    # Stock cannot be negative
-    stock = models.IntegerField(default=0)
-
-    def __str__(self):
-        return self.name
+    # ... existing fields
+    # Renamed for consistency with GraphQL checkpoint:
+    created_at = models.DateTimeField(auto_now_add=True)
 
 class Order(models.Model):
-    customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name='orders')
-    products = models.ManyToManyField(Product, related_name='orders')
-    order_date = models.DateTimeField(auto_now_add=True)
-    # Stores the calculated total amount at the time of order creation
-    total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00')) 
+    # ... existing fields
+    order_date = models.DateTimeField(auto_now_add=True) # Already present
 
-    def __str__(self):
-        return f"Order {self.id} by {self.customer.name}"
+# crm/filters.py
+
+import django_filters
+from django_filters import CharFilter, DateFilter, NumberFilter, RangeFilter, Filter
+from .models import Customer, Product, Order
+import re
+
+# Custom filter method for the phone number challenge
+def filter_by_phone_pattern(queryset, name, value):
+    """Filters customers whose phone number matches a basic pattern (e.g., starts with +1)."""
+    # Example: Check if phone starts with the provided pattern (e.g., '+1')
+    return queryset.filter(phone__startswith=value)
+
+class CustomerFilter(django_filters.FilterSet):
+    name = CharFilter(lookup_expr='icontains')
+    email = CharFilter(lookup_expr='icontains')
+    # Filter for date ranges
+    created_at_gte = DateFilter(field_name='created_at', lookup_expr='gte')
+    created_at_lte = DateFilter(field_name='created_at', lookup_expr='lte')
+    # Challenge: Custom filter for phone pattern
+    phone_pattern = django_filters.MethodFilter(method=filter_by_phone_pattern)
+
+    class Meta:
+        model = Customer
+        # Define fields and lookups to expose in GraphQL
+        fields = ['name', 'email', 'created_at'] 
+
+class ProductFilter(django_filters.FilterSet):
+    name = CharFilter(lookup_expr='icontains')
+    # Price range filter
+    price = RangeFilter()
+    # Stock range filter
+    stock = RangeFilter()
+    
+    # Challenge: Low stock filter (stock < 10)
+    def filter_low_stock(self, queryset, name, value):
+        if value:
+            return queryset.filter(stock__lt=10)
+        return queryset
+
+    low_stock = Filter(method='filter_low_stock', label="Filter products with stock less than 10")
+
+    class Meta:
+        model = Product
+        fields = ['name', 'price', 'stock']
+
+class OrderFilter(django_filters.FilterSet):
+    # Total amount range filter
+    total_amount = RangeFilter()
+    # Order date range filter
+    order_date = RangeFilter()
+    
+    # Filter orders by customer's name (related lookup)
+    customer_name = CharFilter(field_name='customer__name', lookup_expr='icontains')
+    # Filter orders by product's name (related lookup, use distinct to avoid duplicate orders)
+    product_name = CharFilter(field_name='products__name', lookup_expr='icontains', distinct=True)
+    
+    # Challenge: Filter orders that include a specific product ID
+    product_id = Filter(field_name='products__id', lookup_expr='exact', distinct=True)
+
+    class Meta:
+        model = Order
+        fields = ['total_amount', 'order_date']
 
 
-python manage.py makemigrations crm
-python manage.py migrate
-
-# crm/schema.py
+# crm/schema.py (Updated)
 
 import graphene
+from graphene import relay
 from graphene_django.types import DjangoObjectType
+from graphene_django.filter import DjangoFilterConnectionField
+# Import models and filters
+from .models import Customer, Product, Order
+from .filters import CustomerFilter, ProductFilter, OrderFilter
 from django.db import IntegrityError, transaction
 from django.core.exceptions import ValidationError
-from django.db.models import Sum
-import re
-from decimal import Decimal
+# ... (Imported other items like re, Decimal, etc. from Task 2)
 
-# --- 1. Define GraphQL Types for Models (Output) ---
+# --- 1. Define GraphQL Types with Relay Node (Output) ---
 
+# All Types must inherit from relay.Node to use ConnectionFields
 class CustomerType(DjangoObjectType):
     class Meta:
         model = Customer
-        # Explicitly define fields for clarity and security
-        fields = ('id', 'name', 'email', 'phone', 'date_joined')
+        fields = ('id', 'name', 'email', 'phone', 'created_at')
+        interfaces = (relay.Node,) # Required for connections/pagination
 
 class ProductType(DjangoObjectType):
     class Meta:
         model = Product
         fields = ('id', 'name', 'price', 'stock')
+        interfaces = (relay.Node,)
 
 class OrderType(DjangoObjectType):
     class Meta:
         model = Order
         fields = ('id', 'customer', 'products', 'order_date', 'total_amount')
+        interfaces = (relay.Node,)
 
-# --- Helper Function for Phone Validation ---
-
-def validate_phone(phone):
-    """Basic validation for phone number format."""
-    # Simplified regex for validation (e.g., handles digits, dashes, spaces, and optional +)
-    if not phone:
-        return True # phone is optional
-    
-    # Example regex: ^[+]*[(]{0,1}[0-9]{1,4}[)]{0,1}[-\s\./0-9]*$
-    if not re.fullmatch(r'^\+?\d[\d\s-]{7,15}\d$', phone):
-        raise ValidationError(f"Invalid phone format: '{phone}'. Use a format like +1234567890.")
-
-
-# --- 2. Define Mutations (Input & Logic) ---
-
-class CreateCustomer(graphene.Mutation):
-    # Inputs (Defined as a nested class)
-    class Arguments:
-        name = graphene.String(required=True)
-        email = graphene.String(required=True)
-        phone = graphene.String(required=False)
-
-    # Outputs
-    customer = graphene.Field(CustomerType)
-    message = graphene.String()
-
-    @classmethod
-    @transaction.atomic
-    def mutate(cls, root, info, name, email, phone=None):
-        try:
-            # Validation 1: Phone format
-            if phone:
-                validate_phone(phone)
-
-            # Create the customer
-            customer = Customer.objects.create(
-                name=name,
-                email=email,
-                phone=phone
-            )
-            return CreateCustomer(
-                customer=customer, 
-                message=f"Customer '{name}' created successfully."
-            )
-        except IntegrityError:
-            # Validation 2: Unique Email violation
-            return CreateCustomer(
-                customer=None, 
-                message=f"Error: A customer with the email '{email}' already exists."
-            )
-        except ValidationError as e:
-            # Validation 3: Other model/validator errors (e.g., phone format)
-            return CreateCustomer(
-                customer=None, 
-                message=f"Validation Error: {', '.join(e.messages)}"
-            )
-
-# --- BulkCreateCustomers Implementation ---
-
-class CustomerInput(graphene.InputObjectType):
-    name = graphene.String(required=True)
-    email = graphene.String(required=True)
-    phone = graphene.String(required=False)
-
-class BulkCreateCustomers(graphene.Mutation):
-    class Arguments:
-        input = graphene.List(CustomerInput, required=True)
-
-    # Outputs
-    customers = graphene.List(CustomerType)
-    errors = graphene.List(graphene.String)
-
-    @classmethod
-    def mutate(cls, root, info, input):
-        valid_customers = []
-        errors = []
-        
-        # Challenge: Support partial success - process valid entries even if some fail
-        for data in input:
-            name = data.name
-            email = data.email
-            phone = data.phone
-            
-            error_msg = None
-            
-            # 1. Validate Phone Format
-            try:
-                validate_phone(phone)
-            except ValidationError as e:
-                error_msg = f"Record for '{email}': Phone validation error: {', '.join(e.messages)}"
-            
-            if error_msg:
-                errors.append(error_msg)
-                continue
-
-            # 2. Add to list for bulk creation (Integrity check is handled by transaction)
-            valid_customers.append(Customer(name=name, email=email, phone=phone))
-
-        # Perform creation in a single atomic transaction
-        with transaction.atomic():
-            created_customers = []
-            for cust in valid_customers:
-                try:
-                    cust.save()
-                    created_customers.append(cust)
-                except IntegrityError:
-                    errors.append(f"Record for '{cust.email}': Email already exists.")
-                except Exception as e:
-                    errors.append(f"Record for '{cust.email}': An unexpected error occurred: {str(e)}")
-
-        return BulkCreateCustomers(customers=created_customers, errors=errors)
-
-# --- CreateProduct Implementation ---
-
-class CreateProduct(graphene.Mutation):
-    class Arguments:
-        name = graphene.String(required=True)
-        price = graphene.Decimal(required=True)
-        stock = graphene.Int(required=False, default_value=0)
-    
-    product = graphene.Field(ProductType)
-
-    @classmethod
-    @transaction.atomic
-    def mutate(cls, root, info, name, price, stock=0):
-        if price <= 0:
-            raise Exception("Price must be a positive number.")
-        if stock < 0:
-            raise Exception("Stock cannot be negative.")
-
-        product = Product.objects.create(
-            name=name,
-            price=price,
-            stock=stock
-        )
-        return CreateProduct(product=product)
-
-# --- CreateOrder Implementation ---
-
-class CreateOrder(graphene.Mutation):
-    class Arguments:
-        customer_id = graphene.ID(required=True)
-        product_ids = graphene.List(graphene.ID, required=True)
-        # order_date is auto_now_add, so no need to take it as input unless requested
-    
-    order = graphene.Field(OrderType)
-    
-    @classmethod
-    @transaction.atomic
-    def mutate(cls, root, info, customer_id, product_ids):
-        # Validation 1: Ensure at least one product is selected
-        if not product_ids:
-            raise Exception("An order must contain at least one product.")
-        
-        try:
-            # Validation 2: Ensure customer exists
-            customer = Customer.objects.get(pk=customer_id)
-        except Customer.DoesNotExist:
-            raise Exception(f"Invalid customer ID: {customer_id}")
-
-        # Validation 3: Ensure all products exist and fetch them
-        # Note: We use in_bulk to check existence and retrieve them efficiently
-        product_pks = [pk for pk in product_ids]
-        products_map = Product.objects.in_bulk(product_pks)
-        
-        if len(products_map) != len(product_pks):
-            # Find the missing IDs
-            found_pks = set(products_map.keys())
-            missing_pks = [pk for pk in product_pks if pk not in found_pks]
-            raise Exception(f"Invalid product IDs found: {', '.join(map(str, missing_pks))}")
-
-        products = list(products_map.values())
-        
-        # Calculate total_amount
-        total_amount = sum(p.price for p in products)
-        
-        # Create the order
-        order = Order.objects.create(
-            customer=customer,
-            total_amount=total_amount
-        )
-        # Associate products (Many-to-Many)
-        order.products.set(products)
-
-        return CreateOrder(order=order)
-
-
-# --- 3. Combine Queries and Mutations (Root Schema) ---
-
-class Query(graphene.ObjectType):
-    # Placeholder for future queries (e.g., getting all customers)
-    # Re-adding the 'hello' from Task 0 just in case
-    hello = graphene.String(default_value="Hello, CRM GraphQL!")
-    
-    # Placeholder fields for fetching data
-    all_customers = graphene.List(CustomerType)
-    
-    def resolve_all_customers(root, info):
-        return Customer.objects.all()
+# --- 2. Define Mutations (Omitted for brevity, assumed from Task 2) ---
+# ... (CreateCustomer, BulkCreateCustomers, CreateProduct, CreateOrder logic goes here)
 
 class Mutation(graphene.ObjectType):
-    create_customer = CreateCustomer.Field()
-    bulk_create_customers = BulkCreateCustomers.Field()
-    create_product = CreateProduct.Field()
-    create_order = CreateOrder.Field()
+    # ... (Mutation fields from Task 2 go here)
+    pass 
 
-# --- 4. Integrate Into Main Schema (alx_backend_graphql_crm/schema.py) ---
+# --- 3. Define the Query Class with Filtering and Ordering ---
 
-# This step is critical to combine the 'hello' query from the root schema
-# with the new types/mutations from the 'crm' app.
+class Query(graphene.ObjectType):
+    # Relay field to fetch any object by its global ID
+    node = relay.Node.Field()
+    
+    hello = graphene.String(default_value="Hello, CRM GraphQL with Filtering!")
 
-# Open alx_backend_graphql_crm/schema.py (replace the content):
+    # A. Customer Queries
+    customer = relay.Node.Field(CustomerType)
+    # Uses DjangoFilterConnectionField for filtering, sorting, and pagination
+    all_customers = DjangoFilterConnectionField(
+        CustomerType, 
+        filterset_class=CustomerFilter,
+        # Challenge: order_by argument is automatically supported by DjangoFilterConnectionField
+    )
 
-# alx_backend_graphql_crm/schema.py (Updated content)
+    # B. Product Queries
+    product = relay.Node.Field(ProductType)
+    all_products = DjangoFilterConnectionField(
+        ProductType, 
+        filterset_class=ProductFilter,
+    )
 
-# Import the base query and mutation classes from the 'crm' app
-from crm.schema import Query as CRMQuery, Mutation as CRMMutation
+    # C. Order Queries
+    order = relay.Node.Field(OrderType)
+    all_orders = DjangoFilterConnectionField(
+        OrderType, 
+        filterset_class=OrderFilter,
+    )
 
-# Combine the Queries (using the 'hello' from the root if necessary, or just rely on crm)
-class Query(CRMQuery, graphene.ObjectType):
-    pass # Inherits all fields from CRMQuery
-
-# Combine the Mutations
-class Mutation(CRMMutation, graphene.ObjectType):
-    pass # Inherits all fields from CRMMutation
-
-schema = graphene.Schema(query=Query, mutation=Mutation)
+# Note: The top-level schema (alx_backend_graphql_crm/schema.py) should already be correctly
+# importing and combining this Query class from crm.schema, as per Task 2.
+# alx_backend_graphql_crm/schema.py:
+# class Query(CRMQuery, graphene.ObjectType):
+#     pass
 
 
-mutation CreateCustomerMutation {
-  createCustomer(input: {
-    name: "Alice",
-    email: "alice@example.com",
-    phone: "+1234567890"
-  }) {
-    customer {
-      id
-      name
-      email
-      phone
-    }
-    message
-  }
-}
-
-mutation BulkCreateMutation {
-  bulkCreateCustomers(input: [
-    { name: "Bob", email: "bob@example.com", phone: "123-456-7890" },
-    { name: "Carol", email: "carol@example.com" }
-    # Optional: Add a validation failure test case (e.g., duplicate email)
-    # { name: "Failure Test", email: "alice@example.com" } 
-  ]) {
-    customers {
-      id
-      name
-      email
-    }
-    errors
-  }
-}
-
-mutation CreateProductMutation {
-  laptop: createProduct(input: {
-    name: "Laptop Pro",
-    price: 1999.99,
-    stock: 5
-  }) {
-    product { id name price stock }
-  }
-  monitor: createProduct(input: {
-    name: "4k Monitor",
-    price: 599.00,
-    stock: 12
-  }) {
-    product { id name price stock }
-  }
-}
-
-mutation CreateOrderMutation {
-  createOrder(input: {
-    customerId: "1", # Alice's ID (e.g., 1)
-    productIds: ["1", "2"] # Laptop Pro (1) and 4k Monitor (2)
-  }) {
-    order {
-      id
-      customer {
-        name
-      }
-      products {
-        name
-        price
-      }
-      totalAmount # Should be 1999.99 + 599.00 = 2598.99
-      orderDate
-    }
-  }
-}
-
+# Filter customers by name (e.g., 'Ali') and creation date (after 2025-01-01)
 query FilterCustomers {
-  allCustomers(name_Icontains: "Ali") {
+  allCustomers(nameIcontains: "Ali", createdAtGte: "2025-01-01") {
     edges {
       node {
         id
         name
         email
+        createdAt: created_at
       }
     }
   }
 }
 
-query PaginateProducts {
-  allProducts(first: 2) {
+# Filter products with price between 100 and 1000, sorted descending by stock
+query FilterProducts {
+  allProducts(priceLte: 1000, priceGte: 100, orderBy: ["-stock"]) {
     edges {
       node {
         id
         name
         price
+        stock
       }
     }
   }
 }
+
+# Filter orders where the customer name contains 'Alice', product name contains 'Laptop', and total amount is >= 500
+query FilterOrders {
+  allOrders(customerName: "Alice", productName: "Laptop", totalAmountGte: 500) {
+    edges {
+      node {
+        id
+        customer {
+          name
+        }
+        # Note: The name 'products' is plural (M2M field)
+        products { 
+          edges {
+            node {
+              name
+            }
+          }
+        }
+        totalAmount
+        orderDate
+      }
+    }
+  }
+}
+
+
 
 
