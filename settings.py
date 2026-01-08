@@ -1,45 +1,79 @@
-django-admin startproject alx_backend_graphql_crm
-cd alx_backend_graphql_crm
-python manage.py startapp crm
-
-pip install graphene-django django-filter
-
 INSTALLED_APPS = [
-    ...
-    "crm",
-    "graphene_django",
-    "django_filters",
+    ...,
+    'django_crontab',
+    'crm', # Ensure your app is here
 ]
 
-GRAPHENE = {
-    "SCHEMA": "alx_backend_graphql_crm.schema.schema"
-}
-
-import graphene
-
-class Query(graphene.ObjectType):
-    hello = graphene.String(default_value="Hello, GraphQL!")
-
-schema = graphene.Schema(query=Query)
-
-from django.contrib import admin
-from django.urls import path
-from graphene_django.views import GraphQLView
-from django.views.decorators.csrf import csrf_exempt
-
-urlpatterns = [
-    path("admin/", admin.site.urls),
-    path("graphql", csrf_exempt(GraphQLView.as_view(graphiql=True))),
+pip install -r requirements.txt
+#crm/settings.py
+INSTALLED_APPS = [
+    # ...
+    "django_crontab",
 ]
 
-python manage.py runserver
+crm/cron.py
 
-{
-  hello
-}
+#crm/cron.py
+from datetime import datetime
+import requests
 
-{
-  "data": {
-    "hello": "Hello, GraphQL!"
-  }
-}
+LOG_FILE = "/tmp/crm_heartbeat_log.txt"
+GRAPHQL_ENDPOINT = "http://localhost:8000/graphql"
+
+
+def log_crm_heartbeat():
+    """
+    Logs a heartbeat message every 5 minutes
+    to confirm the CRM application is alive.
+    """
+
+    timestamp = datetime.now().strftime("%d/%m/%Y-%H:%M:%S")
+    message = f"{timestamp} CRM is alive"
+
+    # Optional GraphQL health check
+    try:
+        response = requests.post(
+            GRAPHQL_ENDPOINT,
+            json={"query": "{ hello }"},
+            timeout=5,
+        )
+        if response.status_code == 200:
+            message += " | GraphQL OK"
+        else:
+            message += " | GraphQL ERROR"
+    except Exception:
+        message += " | GraphQL UNREACHABLE"
+
+    # Append heartbeat log
+    with open(LOG_FILE, "a") as log:
+        log.write(message + "\n")
+
+"%d/%m/%Y-%H:%M:%S"
+
+DD/MM/YYYY-HH:MM:SS CRM is alive
+
+open(LOG_FILE, "a")
+
+{ hello }
+
+#crm/settings.py
+CRONJOBS = [
+    ('*/5 * * * *', 'crm.cron.log_crm_heartbeat'),
+]
+
+*/5 * * * *
+
+python manage.py crontab add
+
+python manage.py crontab show
+
+python manage.py crontab remove
+
+cat /tmp/crm_heartbeat_log.txt
+
+08/01/2026-08:05:00 CRM is alive | GraphQL OK
+08/01/2026-08:10:00 CRM is alive | GraphQL OK
+
+CRM is alive | GraphQL UNREACHABLE
+
+
